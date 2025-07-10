@@ -1,192 +1,260 @@
-// via https://github.com/vercel/ai/blob/main/examples/next-openai/app/api/use-chat-human-in-the-loop/utils.ts
-
-import type { ClientMessage, Message } from "ai";
-import { parseStreamPart } from "ai";
-import { createParser } from "eventsource-parser";
+import type { Message } from "ai";
 
 /**
  * Creates an agent client that connects to the Personal Assistant
- * Supports both WebSocket and HTTP connections
- * @param id - Optional ID for the agent instance
- * @returns Agent client with send and connect methods
+ * Optimized for both WebSocket and HTTP connections
  */
 export function createAgentClient(id = "main-assistant") {
   const baseUrl = window.location.origin;
   const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  
+  // Cache the WebSocket URL
+  const wsUrl = `${wsProtocol}//${window.location.host}/agents/personal-assistant/${id}`;
 
   return {
-    // Send messages via HTTP POST
-    async send(messages: ClientMessage[]) {
-      const response = await fetch(`${baseUrl}/stream`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(messages),
-      });
+    // Send messages via HTTP POST with proper error handling
+    async send(messages: Message[]) {
+      try {
+        const response = await fetch(`${baseUrl}/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(messages),
+        });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(`API Error (${response.status}): ${error}`);
+        }
+
+        return response;
+      } catch (error) {
+        console.error("Failed to send message:", error);
+        throw error;
       }
-
-      return response;
     },
 
-    // Connect via WebSocket for real-time communication
-    connect() {
-      const ws = new WebSocket(
-        `${wsProtocol}//${window.location.host}/agents/personal-assistant/${id}`
-      );
+    // WebSocket connection with reconnection support
+    connect(options?: { 
+      onOpen?: () => void;
+      onError?: (error: Event) => void;
+      reconnectAttempts?: number;
+    }) {
+      let ws: WebSocket | null = null;
+      let reconnectCount = 0;
+      const maxReconnects = options?.reconnectAttempts ?? 3;
+
+      const connect = () => {
+        ws = new WebSocket(wsUrl);
+        
+        ws.onopen = () => {
+          reconnectCount = 0;
+          options?.onOpen?.();
+        };
+        
+        ws.onerror = (event) => {
+          options?.onError?.(event);
+          
+          // Auto-reconnect logic
+          if (reconnectCount < maxReconnects) {
+            reconnectCount++;
+            setTimeout(connect, 1000 * reconnectCount); // Exponential backoff
+          }
+        };
+      };
+
+      connect();
 
       return {
-        send: (data: string) => ws.send(data),
+        send: (data: string | object) => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(typeof data === 'string' ? data : JSON.stringify(data));
+          } else {
+            console.warn("WebSocket not connected");
+          }
+        },
         onMessage: (handler: (event: MessageEvent) => void) => {
-          ws.onmessage = handler;
+          if (ws) ws.onmessage = handler;
         },
         onError: (handler: (event: Event) => void) => {
-          ws.onerror = handler;
+          if (ws) ws.onerror = handler;
         },
         onClose: (handler: (event: CloseEvent) => void) => {
-          ws.onclose = handler;
+          if (ws) ws.onclose = handler;
         },
-        close: () => ws.close(),
+        close: () => {
+          if (ws) {
+            ws.close();
+            ws = null;
+          }
+        },
+        getState: () => ws?.readyState,
       };
     },
   };
 }
 
 /**
- * Parses streaming data responses from the AI
- * Handles both text content and structured data
- * @param data - Raw streaming data
- * @returns Parsed content as Message array or null
+ * Formats a timestamp for display with memoization
  */
-export function parseStreamingDataResponse(data: string): Message[] | null {
-  const trimmedData = data.trim();
-  if (!trimmedData || trimmedData === "{}") return null;
+const timeFormatter = new Intl.DateTimeFormat([], {
+  hour: "2-digit",
+  minute: "2-digit",
+});
 
-  if (trimmedData.startsWith("0:")) {
-    try {
-      return JSON.parse(trimmedData.slice(2)) as Message[];
-    } catch (e) {
-      console.error("Failed to parse messages:", e);
-      return null;
-    }
-  }
-
-  if (trimmedData.startsWith("8:") || trimmedData.startsWith("e:")) {
-    const content = trimmedData.slice(2);
-    try {
-      const json = JSON.parse(content);
-      return [json];
-    } catch (e) {
-      console.error("Failed to parse JSON content:", e);
-      return null;
-    }
-  }
-
-  try {
-    const parser = createParser((event) => {
-      if (event.type === "data" && event.data) {
-        const parsed = parseStreamPart(event.data);
-        if (parsed.type === "text") {
-          return [
-            {
-              role: "assistant",
-              content: parsed.value,
-            },
-          ];
-        }
-      }
-    });
-
-    parser.feed(trimmedData);
-  } catch (e) {
-    console.error("Failed to parse streaming data:", e);
-  }
-
-  return null;
+export function formatTime(date: Date | string): string {
+  const dateObj = typeof date === 'string' ? new Date(date) : date;
+  return timeFormatter.format(dateObj);
 }
 
 /**
- * Formats a message timestamp for display
- * @param date - Date to format
- * @returns Formatted time string
+ * Optimized debounce function with proper typing
  */
-export function formatTime(date: Date): string {
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/**
- * Debounces a function call
- * @param func - Function to debounce
- * @param wait - Wait time in milliseconds
- * @returns Debounced function
- */
-export function debounce<T extends (...args: any[]) => void>(
+export function debounce<T extends (...args: any[]) => any>(
   func: T,
-  wait: number
+  wait: number,
+  options?: { leading?: boolean; trailing?: boolean }
 ): (...args: Parameters<T>) => void {
-  let timeout: ReturnType<typeof setTimeout>;
-  return (...args: Parameters<T>) => {
-    clearTimeout(timeout);
-    timeout = setTimeout(() => func(...args), wait);
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  let lastArgs: Parameters<T> | null = null;
+  
+  const { leading = false, trailing = true } = options || {};
+
+  return function debounced(...args: Parameters<T>) {
+    lastArgs = args;
+    
+    const invokeFunc = () => {
+      if (lastArgs && trailing) {
+        func(...lastArgs);
+      }
+      timeout = null;
+      lastArgs = null;
+    };
+
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+
+    if (leading && !timeout) {
+      func(...args);
+    }
+
+    timeout = setTimeout(invokeFunc, wait);
   };
 }
 
 /**
- * Process tool calls and handle confirmations
- * @param messages - Array of messages
- * @param dataStream - Data stream for responses
- * @param tools - Available tools
- * @param executions - Tool execution functions
- * @returns Processed messages
+ * Throttle function for rate limiting
  */
-export async function processToolCalls({
-  messages,
-  dataStream,
-  tools,
-  executions,
-}: {
-  messages: Message[];
-  dataStream: any;
-  tools: Record<string, any>;
-  executions: Record<string, any>;
-}): Promise<Message[]> {
-  const lastMessage = messages[messages.length - 1];
+export function throttle<T extends (...args: any[]) => any>(
+  func: T,
+  limit: number
+): (...args: Parameters<T>) => void {
+  let inThrottle = false;
+  let lastArgs: Parameters<T> | null = null;
+
+  return function throttled(...args: Parameters<T>) {
+    if (!inThrottle) {
+      func(...args);
+      inThrottle = true;
+      
+      setTimeout(() => {
+        inThrottle = false;
+        if (lastArgs) {
+          func(...lastArgs);
+          lastArgs = null;
+        }
+      }, limit);
+    } else {
+      lastArgs = args;
+    }
+  };
+}
+
+/**
+ * Retry utility for API calls
+ */
+export async function retry<T>(
+  fn: () => Promise<T>,
+  options: {
+    attempts?: number;
+    delay?: number;
+    backoff?: boolean;
+    onRetry?: (error: Error, attempt: number) => void;
+  } = {}
+): Promise<T> {
+  const { attempts = 3, delay = 1000, backoff = true, onRetry } = options;
   
-  if (
-    lastMessage.role === "assistant" &&
-    lastMessage.toolInvocations &&
-    lastMessage.toolInvocations.length > 0
-  ) {
-    for (const toolInvocation of lastMessage.toolInvocations) {
-      if ("result" in toolInvocation) continue;
-
-      const { toolCallId, toolName, args } = toolInvocation;
-
-      if (tools[toolName]?.execute) {
-        // Auto-execute tools that have an execute function
-        const result = await tools[toolName].execute(args);
-        dataStream.writeData({
-          type: "tool-result",
-          toolCallId,
-          result,
-        });
-      } else if (executions[toolName]) {
-        // Execute confirmed tools
-        const result = await executions[toolName](args);
-        dataStream.writeData({
-          type: "tool-result", 
-          toolCallId,
-          result,
-        });
+  let lastError: Error;
+  
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      
+      if (i < attempts - 1) {
+        onRetry?.(lastError, i + 1);
+        const waitTime = backoff ? delay * Math.pow(2, i) : delay;
+        await new Promise(resolve => setTimeout(resolve, waitTime));
       }
     }
   }
+  
+  throw lastError!;
+}
 
-  return messages;
+/**
+ * Local storage helper with error handling
+ */
+export const storage = {
+  get<T>(key: string, defaultValue?: T): T | null {
+    try {
+      const item = localStorage.getItem(key);
+      return item ? JSON.parse(item) : defaultValue ?? null;
+    } catch (error) {
+      console.error(`Error reading from localStorage:`, error);
+      return defaultValue ?? null;
+    }
+  },
+  
+  set<T>(key: string, value: T): boolean {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (error) {
+      console.error(`Error writing to localStorage:`, error);
+      return false;
+    }
+  },
+  
+  remove(key: string): boolean {
+    try {
+      localStorage.removeItem(key);
+      return true;
+    } catch (error) {
+      console.error(`Error removing from localStorage:`, error);
+      return false;
+    }
+  },
+  
+  clear(): boolean {
+    try {
+      localStorage.clear();
+      return true;
+    } catch (error) {
+      console.error(`Error clearing localStorage:`, error);
+      return false;
+    }
+  }
+};
+
+/**
+ * Generate unique IDs efficiently
+ */
+export function generateId(prefix = ""): string {
+  const timestamp = Date.now().toString(36);
+  const randomPart = Math.random().toString(36).substring(2, 9);
+  return prefix ? `${prefix}_${timestamp}_${randomPart}` : `${timestamp}_${randomPart}`;
 }

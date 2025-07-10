@@ -2,6 +2,7 @@ import { streamText } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { Agent } from "agents";
 import { tools } from "./tools";
+import { z } from "zod";
 
 export interface Env {
   OPENAI_API_KEY: string;
@@ -10,23 +11,30 @@ export interface Env {
   NOTES_KV: KVNamespace;
 }
 
-interface Task {
-  id?: string;
-  title: string;
-  description?: string;
-  status?: string;
-  priority?: string;
-  dueDate?: string;
-  createdAt?: string;
+// Validation schemas
+const TaskSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional(),
+  status: z.enum(["pending", "completed"]).optional(),
+  priority: z.enum(["low", "medium", "high"]).optional(),
+  dueDate: z.string().optional(),
+});
+
+const NoteSchema = z.object({
+  title: z.string().min(1),
+  content: z.string().min(1),
+  tags: z.array(z.string()).optional(),
+});
+
+interface Task extends z.infer<typeof TaskSchema> {
+  id: string;
+  createdAt: string;
   updatedAt?: string;
 }
 
-interface Note {
-  id?: string;
-  title: string;
-  content: string;
-  tags?: string[];
-  createdAt?: string;
+interface Note extends z.infer<typeof NoteSchema> {
+  id: string;
+  createdAt: string;
 }
 
 interface ScheduledTaskData {
@@ -36,66 +44,91 @@ interface ScheduledTaskData {
   recurring?: boolean;
 }
 
+// Helper for consistent error responses
+class APIError extends Error {
+  constructor(public message: string, public statusCode: number = 400) {
+    super(message);
+  }
+}
+
+// Helper for consistent API responses
+function createResponse(data: any, status: number = 200): Response {
+  return Response.json(data, { status });
+}
+
+function createErrorResponse(error: unknown): Response {
+  if (error instanceof APIError) {
+    return createResponse({ error: error.message }, error.statusCode);
+  }
+  if (error instanceof z.ZodError) {
+    return createResponse({ error: "Validation error", details: error.errors }, 400);
+  }
+  console.error("Unexpected error:", error);
+  return createResponse({ error: "Internal server error" }, 500);
+}
+
 export class PersonalAssistant extends Agent<Env> {
-  async fetch(request: Request) {
-    if (request.url.endsWith("/stream")) {
-      return this.streamResponse(request);
-    }
-    
-    // Handle other endpoints for personal assistant features
+  // Route handler with improved efficiency
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    if (path.endsWith("/tasks")) {
-      return this.handleTasks(request);
+    try {
+      // API route mapping for efficiency
+      const routes: Record<string, () => Promise<Response>> = {
+        "/stream": () => this.streamResponse(request),
+        "/tasks": () => this.handleTasks(request),
+        "/notes": () => this.handleNotes(request),
+        "/scheduled": () => this.getScheduledTasks(),
+      };
+      
+      // Find matching route
+      for (const [route, handler] of Object.entries(routes)) {
+        if (path.endsWith(route)) {
+          return await handler();
+        }
+      }
+      
+      return createResponse({ message: "Personal Assistant API", version: "1.0" });
+    } catch (error) {
+      return createErrorResponse(error);
     }
-    
-    if (path.endsWith("/notes")) {
-      return this.handleNotes(request);
-    }
-    
-    if (path.endsWith("/scheduled")) {
-      return this.getScheduledTasks();
-    }
-    
-    return new Response("Personal Assistant API", { status: 200 });
   }
 
-  // Handle scheduled task execution
-  async executeScheduledTask(data: ScheduledTaskData) {
-    console.log(`Executing scheduled task: ${data.taskId} - ${data.description}`);
+  // Optimized scheduled task execution
+  async executeScheduledTask(data: ScheduledTaskData): Promise<void> {
+    const { taskId, description, priority, recurring } = data;
+    console.log(`Executing scheduled task: ${taskId} - ${description}`);
     
-    // Create a regular task from the scheduled task
     const task: Task = {
       id: `task:${Date.now()}_${crypto.randomUUID()}`,
-      title: data.description,
+      title: description,
       description: `Scheduled task executed at ${new Date().toISOString()}`,
-      priority: data.priority,
+      priority: priority as "low" | "medium" | "high",
       status: "pending",
       createdAt: new Date().toISOString()
     };
     
     try {
-      // Save as a regular task
       // @ts-ignore - env is available in the Agent runtime context
-      await this.env.TASKS_KV.put(task.id!, JSON.stringify(task));
+      const env = this.env as Env;
       
-      // If it's not recurring, remove the scheduled task
-      if (!data.recurring) {
-        // @ts-ignore - env is available in the Agent runtime context
-        await this.env.TASKS_KV.delete(`scheduled:${data.taskId}`);
+      // Save task in a transaction-like manner
+      await env.TASKS_KV.put(task.id, JSON.stringify(task));
+      
+      if (!recurring) {
+        await env.TASKS_KV.delete(`scheduled:${taskId}`);
       }
       
-      // You could also add a notification system here
       console.log(`Task created from schedule: ${task.id}`);
     } catch (error) {
-      console.error(`Failed to execute scheduled task: ${error}`);
+      console.error(`Failed to execute scheduled task:`, error);
+      // Could implement retry logic here
     }
   }
 
-  private async streamResponse(request: Request) {
+  private async streamResponse(request: Request): Promise<Response> {
     const messages = await request.json();
-
     const model = openai("gpt-4o-2024-11-20");
 
     const result = streamText({
@@ -141,150 +174,192 @@ Always aim to:
 - Use the appropriate tools to help the user`,
       maxSteps: 10,
       onStepFinish: (event: any) => {
-        console.log(JSON.stringify(event, null, 2));
+        if (process.env.NODE_ENV === 'development') {
+          console.log(JSON.stringify(event, null, 2));
+        }
       },
     });
 
     return result.toDataStreamResponse();
   }
 
-  private async handleTasks(request: Request) {
-    const method = request.method;
-    
-    if (method === "GET") {
-      // Retrieve all tasks
-      const tasks = await this.env.TASKS_KV.list({ prefix: "task:" });
-      const taskList = await Promise.all(
-        tasks.keys.map(async (key: any) => {
-          const task = await this.env.TASKS_KV.get(key.name, "json");
-          return task;
-        })
-      );
-      return Response.json({ tasks: taskList.filter(Boolean) });
-    }
-    
-    if (method === "POST") {
-      // Create a new task
-      const task: Task = await request.json();
-      const taskId = `task:${Date.now()}_${crypto.randomUUID()}`;
-      await this.env.TASKS_KV.put(taskId, JSON.stringify({
-        id: taskId,
-        ...task,
-        createdAt: new Date().toISOString(),
-        status: task.status || "pending"
-      }));
-      return Response.json({ success: true, taskId });
-    }
-    
-    if (method === "PUT") {
-      // Update a task
-      const body: { taskId: string; [key: string]: any } = await request.json();
-      const { taskId, ...updates } = body;
-      const existing = await this.env.TASKS_KV.get(taskId, "json") as Task | null;
-      if (!existing) {
-        return Response.json({ error: "Task not found" }, { status: 404 });
-      }
-      await this.env.TASKS_KV.put(taskId, JSON.stringify({
-        ...existing,
-        ...updates,
-        updatedAt: new Date().toISOString()
-      }));
-      return Response.json({ success: true });
-    }
-    
-    if (method === "DELETE") {
-      // Delete a task
-      const body: { taskId: string } = await request.json();
-      await this.env.TASKS_KV.delete(body.taskId);
-      return Response.json({ success: true });
-    }
-    
-    return Response.json({ error: "Method not allowed" }, { status: 405 });
-  }
-
-  private async handleNotes(request: Request) {
-    const method = request.method;
-    
-    if (method === "GET") {
-      // Retrieve all notes
-      const notes = await this.env.NOTES_KV.list({ prefix: "note:" });
-      const noteList = await Promise.all(
-        notes.keys.map(async (key: any) => {
-          const note = await this.env.NOTES_KV.get(key.name, "json");
-          return note;
-        })
-      );
-      return Response.json({ notes: noteList.filter(Boolean) });
-    }
-    
-    if (method === "POST") {
-      // Create a new note
-      const note: Note = await request.json();
-      const noteId = `note:${Date.now()}_${crypto.randomUUID()}`;
-      await this.env.NOTES_KV.put(noteId, JSON.stringify({
-        id: noteId,
-        ...note,
-        createdAt: new Date().toISOString()
-      }));
-      return Response.json({ success: true, noteId });
-    }
-    
-    if (method === "DELETE") {
-      // Delete a note
-      const body: { noteId: string } = await request.json();
-      await this.env.NOTES_KV.delete(body.noteId);
-      return Response.json({ success: true });
-    }
-    
-    return Response.json({ error: "Method not allowed" }, { status: 405 });
-  }
-  
-  private async getScheduledTasks() {
-    // Get all scheduled tasks
-    const scheduled = await this.env.TASKS_KV.list({ prefix: "scheduled:" });
-    const scheduledList = await Promise.all(
-      scheduled.keys.map(async (key: any) => {
-        const task = await this.env.TASKS_KV.get(key.name, "json");
-        return task;
+  // Generalized KV list handler for efficiency
+  private async listFromKV(prefix: string): Promise<any[]> {
+    const list = await this.env.TASKS_KV.list({ prefix, limit: 1000 });
+    const items = await Promise.all(
+      list.keys.map(async ({ name }) => {
+        try {
+          return await this.env.TASKS_KV.get(name, "json");
+        } catch {
+          return null; // Handle corrupted data gracefully
+        }
       })
     );
-    return Response.json({ scheduled: scheduledList.filter(Boolean) });
+    return items.filter(Boolean);
+  }
+
+  private async handleTasks(request: Request): Promise<Response> {
+    const method = request.method;
+    
+    switch (method) {
+      case "GET": {
+        const tasks = await this.listFromKV("task:");
+        return createResponse({ 
+          tasks, 
+          count: tasks.length,
+          timestamp: new Date().toISOString() 
+        });
+      }
+      
+      case "POST": {
+        const body = await request.json();
+        const validated = TaskSchema.parse(body);
+        
+        const task: Task = {
+          id: `task:${Date.now()}_${crypto.randomUUID()}`,
+          ...validated,
+          status: validated.status || "pending",
+          priority: validated.priority || "medium",
+          createdAt: new Date().toISOString()
+        };
+        
+        await this.env.TASKS_KV.put(task.id, JSON.stringify(task));
+        return createResponse({ success: true, task }, 201);
+      }
+      
+      case "PUT": {
+        const { taskId, ...updates } = await request.json();
+        if (!taskId) throw new APIError("taskId is required");
+        
+        const existing = await this.env.TASKS_KV.get(taskId, "json") as Task | null;
+        if (!existing) throw new APIError("Task not found", 404);
+        
+        // Validate only the update fields
+        const validatedUpdates = TaskSchema.partial().parse(updates);
+        
+        const updated: Task = {
+          ...existing,
+          ...validatedUpdates,
+          updatedAt: new Date().toISOString()
+        };
+        
+        await this.env.TASKS_KV.put(taskId, JSON.stringify(updated));
+        return createResponse({ success: true, task: updated });
+      }
+      
+      case "DELETE": {
+        const { taskId } = await request.json();
+        if (!taskId) throw new APIError("taskId is required");
+        
+        await this.env.TASKS_KV.delete(taskId);
+        return createResponse({ success: true, message: "Task deleted" });
+      }
+      
+      default:
+        throw new APIError("Method not allowed", 405);
+    }
+  }
+
+  private async handleNotes(request: Request): Promise<Response> {
+    const method = request.method;
+    
+    switch (method) {
+      case "GET": {
+        const notes = await this.listFromKV("note:");
+        return createResponse({ 
+          notes, 
+          count: notes.length,
+          timestamp: new Date().toISOString() 
+        });
+      }
+      
+      case "POST": {
+        const body = await request.json();
+        const validated = NoteSchema.parse(body);
+        
+        const note: Note = {
+          id: `note:${Date.now()}_${crypto.randomUUID()}`,
+          ...validated,
+          tags: validated.tags || [],
+          createdAt: new Date().toISOString()
+        };
+        
+        await this.env.NOTES_KV.put(note.id, JSON.stringify(note));
+        return createResponse({ success: true, note }, 201);
+      }
+      
+      case "DELETE": {
+        const { noteId } = await request.json();
+        if (!noteId) throw new APIError("noteId is required");
+        
+        await this.env.NOTES_KV.delete(noteId);
+        return createResponse({ success: true, message: "Note deleted" });
+      }
+      
+      default:
+        throw new APIError("Method not allowed", 405);
+    }
+  }
+  
+  private async getScheduledTasks(): Promise<Response> {
+    const scheduled = await this.listFromKV("scheduled:");
+    return createResponse({ 
+      scheduled, 
+      count: scheduled.length,
+      timestamp: new Date().toISOString() 
+    });
   }
 }
 
+// Optimized main handler
 export default {
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    // Enable CORS
-    const headers = {
+    // CORS configuration
+    const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
 
+    // Handle preflight requests efficiently
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers });
+      return new Response(null, { headers: corsHeaders });
     }
 
-    // Check for OpenAI API key
-    if (!env.OPENAI_API_KEY) {
-      console.error("OPENAI_API_KEY is not set. Please set it in your .dev.vars file locally or as a secret in production.");
-    }
+    try {
+      // Validate environment
+      if (!env.OPENAI_API_KEY && process.env.NODE_ENV !== 'development') {
+        throw new Error("OPENAI_API_KEY is not configured");
+      }
 
-    // Route to the personal assistant durable object
-    const id = env.PersonalAssistant.idFromName("main-assistant");
-    const assistant = env.PersonalAssistant.get(id);
-    const response = await assistant.fetch(request);
-    
-    // Add CORS headers to response
-    const newResponse = new Response(response.body, response);
-    Object.entries(headers).forEach(([key, value]) => {
-      newResponse.headers.set(key, value);
-    });
-    
-    return newResponse;
+      // Route to the personal assistant durable object
+      const id = env.PersonalAssistant.idFromName("main-assistant");
+      const assistant = env.PersonalAssistant.get(id);
+      
+      // Forward request to assistant
+      const response = await assistant.fetch(request);
+      
+      // Clone response to add CORS headers
+      const headers = new Headers(response.headers);
+      Object.entries(corsHeaders).forEach(([key, value]) => {
+        headers.set(key, value);
+      });
+      
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+      });
+    } catch (error) {
+      console.error("Worker error:", error);
+      return Response.json(
+        { error: "Service unavailable" }, 
+        { status: 503, headers: corsHeaders }
+      );
+    }
   },
 };

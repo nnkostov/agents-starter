@@ -7,46 +7,236 @@ import { z } from "zod";
 import { getCurrentAgent } from "agents";
 import type { PersonalAssistant } from "./server";
 
-// Helper function to get the current agent context
-async function getAgentEnv() {
-  const { agent } = getCurrentAgent<PersonalAssistant>();
-  if (!agent) throw new Error("Agent context not available");
-  return agent.env;
+// Types for better type safety
+interface TaskData {
+  id: string;
+  title?: string;
+  description?: string;
+  status?: string;
+  priority?: string;
+  dueDate?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  type?: string;
+  scheduledFor?: string;
+  cronPattern?: string;
+  delaySeconds?: number;
 }
 
-// Get current time - auto-executing tool
+interface NoteData {
+  id: string;
+  title: string;
+  content: string;
+  tags?: string[];
+  createdAt: string;
+}
+
+// Centralized KV helper functions for better efficiency
+class KVHelper {
+  private static async getEnv() {
+    const { agent } = getCurrentAgent<PersonalAssistant>();
+    if (!agent) throw new Error("Agent context not available");
+    return agent.env;
+  }
+
+  static async saveTask(taskId: string, data: Partial<TaskData>) {
+    const env = await this.getEnv();
+    await env.TASKS_KV.put(taskId, JSON.stringify(data));
+  }
+
+  static async getTask(taskId: string): Promise<TaskData | null> {
+    const env = await this.getEnv();
+    return await env.TASKS_KV.get(taskId, "json");
+  }
+
+  static async listTasks(prefix: string = "task:"): Promise<TaskData[]> {
+    const env = await this.getEnv();
+    const list = await env.TASKS_KV.list({ prefix });
+    const tasks = await Promise.all(
+      list.keys.map(async (key: { name: string }) => {
+        const data = await env.TASKS_KV.get(key.name, "json");
+        return data as TaskData;
+      })
+    );
+    return tasks.filter(Boolean);
+  }
+
+  static async deleteTask(taskId: string) {
+    const env = await this.getEnv();
+    await env.TASKS_KV.delete(taskId);
+  }
+
+  static async saveNote(noteId: string, data: NoteData) {
+    const env = await this.getEnv();
+    await env.NOTES_KV.put(noteId, JSON.stringify(data));
+  }
+
+  static async listNotes(): Promise<NoteData[]> {
+    const env = await this.getEnv();
+    const list = await env.NOTES_KV.list({ prefix: "note:" });
+    const notes = await Promise.all(
+      list.keys.map(async (key: { name: string }) => {
+        const data = await env.NOTES_KV.get(key.name, "json");
+        return data as NoteData;
+      })
+    );
+    return notes.filter(Boolean);
+  }
+}
+
+// Safe math evaluation without using Function constructor
+function evaluateMathExpression(expr: string): number {
+  // Remove whitespace
+  expr = expr.replace(/\s/g, '');
+  
+  // Basic validation - only allow numbers, operators, and parentheses
+  if (!/^[0-9+\-*/().\s]+$/.test(expr)) {
+    throw new Error("Invalid characters in expression");
+  }
+  
+  // Use a simple math parser or return error
+  // For production, use a proper math parser library like mathjs
+  try {
+    // This is still using eval but with strict validation
+    // In production, replace with a proper math parser
+    return eval(expr);
+  } catch {
+    throw new Error("Invalid mathematical expression");
+  }
+}
+
+// Get current time - optimized
 const getCurrentTime = tool({
   description: "Get current server time in a human-readable format",
   parameters: z.object({}),
   execute: async () => {
     const now = new Date();
+    const options = { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone };
     return {
-      time: now.toLocaleTimeString(),
-      date: now.toLocaleDateString(),
+      time: now.toLocaleTimeString('en-US', options),
+      date: now.toLocaleDateString('en-US', options),
       timestamp: now.toISOString(),
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+      timezone: options.timeZone
     };
   },
 });
 
-// Calculate - auto-executing tool
+// Calculate - made safer
 const calculate = tool({
-  description: "Evaluate a mathematical expression",
+  description: "Evaluate a mathematical expression (supports +, -, *, /, parentheses)",
   parameters: z.object({
     expression: z.string(),
   }),
   execute: async ({ expression }) => {
     try {
-      // Using Function constructor for safe evaluation
-      const result = new Function("return " + expression)();
-      return { result, expression };
+      const result = evaluateMathExpression(expression);
+      return { result, expression, success: true };
     } catch (error) {
-      return { error: "Invalid expression", expression };
+      return { 
+        error: error instanceof Error ? error.message : "Invalid expression", 
+        expression,
+        success: false 
+      };
     }
   },
 });
 
-// Schedule task - auto-executing with different scheduling options
+// Helper function for scheduling
+async function scheduleTaskHelper(
+  type: "scheduled" | "delayed" | "recurring",
+  when: string | number,
+  taskDescription: string,
+  priority: string = "medium"
+) {
+  const { agent } = getCurrentAgent<PersonalAssistant>();
+  if (!agent) throw new Error("Agent context not available");
+  
+  const taskId = crypto.randomUUID();
+  const baseTask = {
+    id: taskId,
+    description: taskDescription,
+    priority,
+    status: "scheduled",
+    createdAt: new Date().toISOString()
+  };
+
+  switch (type) {
+    case "scheduled": {
+      const scheduledDate = new Date(when);
+      await agent.schedule(scheduledDate, "executeScheduledTask", {
+        taskId,
+        description: taskDescription,
+        priority
+      });
+      
+      await KVHelper.saveTask(`scheduled:${taskId}`, {
+        ...baseTask,
+        type: "scheduled",
+        scheduledFor: scheduledDate.toISOString()
+      });
+      
+      return {
+        success: true,
+        taskId,
+        scheduledFor: scheduledDate.toISOString(),
+        description: taskDescription,
+        priority
+      };
+    }
+    
+    case "delayed": {
+      const delaySeconds = typeof when === "number" ? when : parseInt(when as string);
+      const scheduledTime = new Date(Date.now() + delaySeconds * 1000);
+      
+      await agent.schedule(delaySeconds, "executeScheduledTask", {
+        taskId,
+        description: taskDescription,
+        priority
+      });
+      
+      await KVHelper.saveTask(`scheduled:${taskId}`, {
+        ...baseTask,
+        type: "delayed",
+        scheduledFor: scheduledTime.toISOString(),
+        delaySeconds
+      });
+      
+      return {
+        success: true,
+        taskId,
+        scheduledFor: scheduledTime.toISOString(),
+        delaySeconds,
+        description: taskDescription,
+        priority
+      };
+    }
+    
+    case "recurring": {
+      await agent.schedule(when as string, "executeScheduledTask", {
+        taskId,
+        description: taskDescription,
+        priority,
+        recurring: true
+      });
+      
+      await KVHelper.saveTask(`scheduled:${taskId}`, {
+        ...baseTask,
+        type: "recurring",
+        cronPattern: when as string
+      });
+      
+      return {
+        success: true,
+        taskId,
+        cronPattern: when,
+        description: taskDescription,
+        priority
+      };
+    }
+  }
+}
+
+// Schedule task - refactored for efficiency
 const scheduleTask = tool({
   description: "Schedule a task or reminder at a specific time, after a delay, or on a recurring schedule",
   parameters: z.object({
@@ -55,100 +245,9 @@ const scheduleTask = tool({
     taskDescription: z.string(),
     priority: z.enum(["low", "medium", "high"]).optional(),
   }),
-  execute: async ({ type, when, taskDescription, priority }) => {
-    const { agent } = getCurrentAgent<PersonalAssistant>();
-    if (!agent) throw new Error("Agent context not available");
-    
-    const taskId = crypto.randomUUID();
-    
+  execute: async ({ type, when, taskDescription, priority = "medium" }) => {
     try {
-      if (type === "scheduled") {
-        // Schedule for a specific date/time
-        const scheduledDate = new Date(when);
-        await agent.schedule(scheduledDate, "executeScheduledTask", {
-          taskId,
-          description: taskDescription,
-          priority: priority || "medium"
-        });
-        
-        // Also save to KV for tracking
-        await agent.env.TASKS_KV.put(`scheduled:${taskId}`, JSON.stringify({
-          id: taskId,
-          type: "scheduled",
-          scheduledFor: scheduledDate.toISOString(),
-          description: taskDescription,
-          priority: priority || "medium",
-          status: "scheduled",
-          createdAt: new Date().toISOString()
-        }));
-        
-        return {
-          success: true,
-          taskId,
-          scheduledFor: scheduledDate.toISOString(),
-          description: taskDescription,
-          priority: priority || "medium"
-        };
-      } else if (type === "delayed") {
-        // Schedule after a delay in seconds
-        const delaySeconds = typeof when === "number" ? when : parseInt(when);
-        await agent.schedule(delaySeconds, "executeScheduledTask", {
-          taskId,
-          description: taskDescription,
-          priority: priority || "medium"
-        });
-        
-        const scheduledTime = new Date(Date.now() + delaySeconds * 1000);
-        
-        // Save to KV
-        await agent.env.TASKS_KV.put(`scheduled:${taskId}`, JSON.stringify({
-          id: taskId,
-          type: "delayed",
-          scheduledFor: scheduledTime.toISOString(),
-          delaySeconds,
-          description: taskDescription,
-          priority: priority || "medium",
-          status: "scheduled",
-          createdAt: new Date().toISOString()
-        }));
-        
-        return {
-          success: true,
-          taskId,
-          scheduledFor: scheduledTime.toISOString(),
-          delaySeconds,
-          description: taskDescription,
-          priority: priority || "medium"
-        };
-      } else {
-        // Recurring task with cron pattern
-        await agent.schedule(when as string, "executeScheduledTask", {
-          taskId,
-          description: taskDescription,
-          priority: priority || "medium",
-          recurring: true
-        });
-        
-        // Save to KV
-        await agent.env.TASKS_KV.put(`scheduled:${taskId}`, JSON.stringify({
-          id: taskId,
-          type: "recurring",
-          cronPattern: when,
-          description: taskDescription,
-          priority: priority || "medium",
-          status: "scheduled",
-          createdAt: new Date().toISOString()
-        }));
-        
-        return {
-          success: true,
-          taskId,
-          cronPattern: when,
-          description: taskDescription,
-          priority: priority || "medium",
-          nextRun: "Calculated based on cron pattern"
-        };
-      }
+      return await scheduleTaskHelper(type, when, taskDescription, priority);
     } catch (error) {
       return {
         success: false,
@@ -158,7 +257,7 @@ const scheduleTask = tool({
   },
 });
 
-// Create task - auto-executing
+// Create task - optimized
 const createTask = tool({
   description: "Create a new task with title, description, due date, and priority",
   parameters: z.object({
@@ -167,37 +266,31 @@ const createTask = tool({
     dueDate: z.string().optional(),
     priority: z.enum(["low", "medium", "high"]).optional(),
   }),
-  execute: async ({ title, description, dueDate, priority }) => {
-    const env = await getAgentEnv();
-    const taskId = `task:${Date.now()}_${crypto.randomUUID()}`;
-    
-    const task = {
-      id: taskId,
-      title,
-      description,
-      dueDate,
-      priority: priority || "medium",
-      status: "pending",
-      createdAt: new Date().toISOString()
-    };
-    
+  execute: async ({ title, description, dueDate, priority = "medium" }) => {
     try {
-      await env.TASKS_KV.put(taskId, JSON.stringify(task));
-      return {
-        success: true,
-        taskId,
-        task
+      const taskId = `task:${Date.now()}_${crypto.randomUUID()}`;
+      const task: TaskData = {
+        id: taskId,
+        title,
+        description,
+        dueDate,
+        priority,
+        status: "pending",
+        createdAt: new Date().toISOString()
       };
+      
+      await KVHelper.saveTask(taskId, task);
+      return { success: true, taskId, task };
     } catch (error) {
       return {
         success: false,
-        error: "Failed to create task"
+        error: error instanceof Error ? error.message : "Failed to create task"
       };
     }
   },
 });
 
-// Take note - auto-executing
+// Take note - optimized
 const takeNote = tool({
   description: "Create a note with a title and content, optionally with tags",
   parameters: z.object({
@@ -205,67 +298,29 @@ const takeNote = tool({
     content: z.string(),
     tags: z.array(z.string()).optional(),
   }),
-  execute: async ({ title, content, tags }) => {
-    const env = await getAgentEnv();
-    const noteId = `note:${Date.now()}_${crypto.randomUUID()}`;
-    
-    const note = {
-      id: noteId,
-      title,
-      content,
-      tags: tags || [],
-      createdAt: new Date().toISOString()
-    };
-    
+  execute: async ({ title, content, tags = [] }) => {
     try {
-      await env.NOTES_KV.put(noteId, JSON.stringify(note));
-      return {
-        success: true,
-        noteId,
-        note
+      const noteId = `note:${Date.now()}_${crypto.randomUUID()}`;
+      const note: NoteData = {
+        id: noteId,
+        title,
+        content,
+        tags,
+        createdAt: new Date().toISOString()
       };
+      
+      await KVHelper.saveNote(noteId, note);
+      return { success: true, noteId, note };
     } catch (error) {
       return {
         success: false,
-        error: "Failed to create note"
+        error: error instanceof Error ? error.message : "Failed to create note"
       };
     }
   },
 });
 
-// Weather information - requires confirmation
-const getWeather = tool({
-  description: "Get current weather information for a location",
-  parameters: z.object({
-    location: z.string(),
-    units: z.enum(["celsius", "fahrenheit"]).optional(),
-  }),
-  // No execute function - requires confirmation
-});
-
-// Web search - requires confirmation
-const searchWeb = tool({
-  description: "Search the web for current information on any topic",
-  parameters: z.object({
-    query: z.string(),
-    resultCount: z.number().min(1).max(10).optional(),
-  }),
-  // No execute function - requires confirmation
-});
-
-// Email draft assistance - requires confirmation
-const draftEmail = tool({
-  description: "Help draft a professional email",
-  parameters: z.object({
-    recipient: z.string(),
-    subject: z.string(),
-    purpose: z.string(),
-    tone: z.enum(["formal", "casual", "friendly", "professional"]).optional(),
-  }),
-  // No execute function - requires confirmation
-});
-
-// List tasks - auto-executing
+// List tasks - optimized with better filtering
 const listTasks = tool({
   description: "List all tasks, optionally filtered by status or priority",
   parameters: z.object({
@@ -273,24 +328,22 @@ const listTasks = tool({
     priority: z.enum(["low", "medium", "high", "all"]).optional(),
   }),
   execute: async ({ status = "all", priority = "all" }) => {
-    const env = await getAgentEnv();
-    
     try {
-      // Get all tasks from KV
-      const tasksList = await env.TASKS_KV.list({ prefix: "task:" });
-      const tasks = await Promise.all(
-        tasksList.keys.map(async (key) => {
-          const taskData = await env.TASKS_KV.get(key.name, "json");
-          return taskData as any;
-        })
-      );
+      const tasks = await KVHelper.listTasks();
       
-      // Filter tasks based on criteria
+      // Efficient filtering
       const filteredTasks = tasks.filter(task => {
         if (!task) return false;
-        if (status !== "all" && task.status !== status) return false;
-        if (priority !== "all" && task.priority !== priority) return false;
-        return true;
+        const statusMatch = status === "all" || task.status === status;
+        const priorityMatch = priority === "all" || task.priority === priority;
+        return statusMatch && priorityMatch;
+      });
+      
+      // Sort by creation date (newest first)
+      filteredTasks.sort((a, b) => {
+        const dateA = new Date(a.createdAt || 0).getTime();
+        const dateB = new Date(b.createdAt || 0).getTime();
+        return dateB - dateA;
       });
       
       return {
@@ -302,14 +355,14 @@ const listTasks = tool({
     } catch (error) {
       return {
         success: false,
-        error: "Failed to retrieve tasks",
+        error: error instanceof Error ? error.message : "Failed to retrieve tasks",
         tasks: []
       };
     }
   },
 });
 
-// Update task - auto-executing
+// Update task - optimized
 const updateTask = tool({
   description: "Update a task's status, priority, or other details",
   parameters: z.object({
@@ -319,11 +372,8 @@ const updateTask = tool({
     dueDate: z.string().optional(),
   }),
   execute: async ({ taskId, status, priority, dueDate }) => {
-    const env = await getAgentEnv();
-    
     try {
-      // Get existing task
-      const existing = await env.TASKS_KV.get(taskId, "json") as any;
+      const existing = await KVHelper.getTask(taskId);
       if (!existing) {
         return {
           success: false,
@@ -331,31 +381,26 @@ const updateTask = tool({
         };
       }
       
-      // Update fields
-      const updated = {
+      const updated: TaskData = {
         ...existing,
-        ...(status && { status }),
-        ...(priority && { priority }),
-        ...(dueDate && { dueDate }),
+        ...(status !== undefined && { status }),
+        ...(priority !== undefined && { priority }),
+        ...(dueDate !== undefined && { dueDate }),
         updatedAt: new Date().toISOString()
       };
       
-      await env.TASKS_KV.put(taskId, JSON.stringify(updated));
-      
-      return {
-        success: true,
-        task: updated
-      };
+      await KVHelper.saveTask(taskId, updated);
+      return { success: true, task: updated };
     } catch (error) {
       return {
         success: false,
-        error: "Failed to update task"
+        error: error instanceof Error ? error.message : "Failed to update task"
       };
     }
   },
 });
 
-// Search notes - auto-executing
+// Search notes - optimized with better search logic
 const searchNotes = tool({
   description: "Search notes by title, content, or tags",
   parameters: z.object({
@@ -363,35 +408,30 @@ const searchNotes = tool({
     searchIn: z.enum(["title", "content", "tags", "all"]).optional(),
   }),
   execute: async ({ query, searchIn = "all" }) => {
-    const env = await getAgentEnv();
-    
     try {
-      // Get all notes from KV
-      const notesList = await env.NOTES_KV.list({ prefix: "note:" });
-      const notes = await Promise.all(
-        notesList.keys.map(async (key) => {
-          const noteData = await env.NOTES_KV.get(key.name, "json");
-          return noteData as any;
-        })
-      );
+      const notes = await KVHelper.listNotes();
+      const queryLower = query.toLowerCase();
       
-      // Search notes based on criteria
-      const searchResults = notes.filter(note => {
-        if (!note) return false;
-        const queryLower = query.toLowerCase();
-        
-        if (searchIn === "all" || searchIn === "title") {
-          if (note.title?.toLowerCase().includes(queryLower)) return true;
-        }
-        if (searchIn === "all" || searchIn === "content") {
-          if (note.content?.toLowerCase().includes(queryLower)) return true;
-        }
-        if (searchIn === "all" || searchIn === "tags") {
-          if (note.tags?.some((tag: string) => tag.toLowerCase().includes(queryLower))) return true;
-        }
-        
-        return false;
-      });
+      // Optimized search with scoring
+      const searchResults = notes
+        .map(note => {
+          if (!note) return null;
+          
+          let score = 0;
+          const titleMatch = note.title?.toLowerCase().includes(queryLower);
+          const contentMatch = note.content?.toLowerCase().includes(queryLower);
+          const tagMatch = note.tags?.some(tag => tag.toLowerCase().includes(queryLower));
+          
+          // Scoring system for relevance
+          if (titleMatch && (searchIn === "all" || searchIn === "title")) score += 3;
+          if (contentMatch && (searchIn === "all" || searchIn === "content")) score += 2;
+          if (tagMatch && (searchIn === "all" || searchIn === "tags")) score += 1;
+          
+          return score > 0 ? { ...note, relevanceScore: score } : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => (b?.relevanceScore || 0) - (a?.relevanceScore || 0))
+        .map(({ relevanceScore, ...note }) => note);
       
       return {
         success: true,
@@ -402,11 +442,38 @@ const searchNotes = tool({
     } catch (error) {
       return {
         success: false,
-        error: "Failed to search notes",
+        error: error instanceof Error ? error.message : "Failed to search notes",
         notes: []
       };
     }
   },
+});
+
+// Confirmation-required tools (no changes needed)
+const getWeather = tool({
+  description: "Get current weather information for a location",
+  parameters: z.object({
+    location: z.string(),
+    units: z.enum(["celsius", "fahrenheit"]).optional(),
+  }),
+});
+
+const searchWeb = tool({
+  description: "Search the web for current information on any topic",
+  parameters: z.object({
+    query: z.string(),
+    resultCount: z.number().min(1).max(10).optional(),
+  }),
+});
+
+const draftEmail = tool({
+  description: "Help draft a professional email",
+  parameters: z.object({
+    recipient: z.string(),
+    subject: z.string(),
+    purpose: z.string(),
+    tone: z.enum(["formal", "casual", "friendly", "professional"]).optional(),
+  }),
 });
 
 export const tools = {
@@ -423,14 +490,13 @@ export const tools = {
   searchNotes,
 };
 
-// Executions for tools that require confirmation
+// Executions remain the same but could integrate real APIs
 export const executions = {
-  getWeather: async ({ location, units }: { location: string; units?: string }) => {
-    // In a real implementation, you would call a weather API here
-    // For now, we'll return a more realistic mock response
+  getWeather: async ({ location, units = "celsius" }: { location: string; units?: string }) => {
+    // TODO: Integrate with real weather API (e.g., OpenWeatherMap)
     const conditions = ["sunny", "partly cloudy", "cloudy", "light rain", "overcast"];
     const condition = conditions[Math.floor(Math.random() * conditions.length)];
-    const temp = Math.floor(Math.random() * 25) + 10; // 10-35°C
+    const temp = Math.floor(Math.random() * 25) + 10;
     
     return {
       location,
@@ -446,38 +512,31 @@ export const executions = {
     };
   },
   
-  searchWeb: async ({ query, resultCount }: { query: string; resultCount?: number }) => {
-    // In a real implementation, you would use a search API like Google Custom Search
-    // or Bing Search API. For now, returning structured mock data
-    const count = resultCount || 5;
+  searchWeb: async ({ query, resultCount = 5 }: { query: string; resultCount?: number }) => {
+    // TODO: Integrate with real search API (e.g., Bing Search API)
     const mockDomains = ["wikipedia.org", "docs.cloudflare.com", "developer.mozilla.org", "stackoverflow.com", "github.com"];
-    const results = [];
-    
-    for (let i = 0; i < count; i++) {
-      results.push({
-        title: `${query} - ${["Complete Guide", "Documentation", "Tutorial", "Best Practices", "Examples"][i % 5]}`,
-        url: `https://${mockDomains[i % mockDomains.length]}/${encodeURIComponent(query.toLowerCase().replace(/\s+/g, '-'))}`,
-        snippet: `Comprehensive information about ${query}. This resource provides detailed insights, examples, and best practices for working with ${query} in modern development...`,
-        source: mockDomains[i % mockDomains.length]
-      });
-    }
+    const results = Array.from({ length: Math.min(resultCount, 10) }, (_, i) => ({
+      title: `${query} - ${["Complete Guide", "Documentation", "Tutorial", "Best Practices", "Examples"][i % 5]}`,
+      url: `https://${mockDomains[i % mockDomains.length]}/${encodeURIComponent(query.toLowerCase().replace(/\s+/g, '-'))}`,
+      snippet: `Comprehensive information about ${query}. This resource provides detailed insights, examples, and best practices...`,
+      source: mockDomains[i % mockDomains.length]
+    }));
     
     return {
       query,
       resultCount: results.length,
       results,
-      searchEngine: "Mock Search",
+      searchEngine: "Mock Search (TODO: Integrate real API)",
       searchedAt: new Date().toISOString()
     };
   },
   
-  draftEmail: async ({ recipient, subject, purpose, tone }: { 
+  draftEmail: async ({ recipient, subject, purpose, tone = "professional" }: { 
     recipient: string; 
     subject: string; 
     purpose: string; 
     tone?: string; 
   }) => {
-    // Generate email draft based on parameters
     const toneMap = {
       formal: { greeting: "Dear", closing: "Sincerely" },
       casual: { greeting: "Hi", closing: "Best" },
@@ -503,7 +562,7 @@ ${selectedTone.closing},
       to: recipient,
       subject,
       draft: emailDraft,
-      tone: tone || "professional",
+      tone,
       wordCount: emailDraft.split(/\s+/).length,
       characterCount: emailDraft.length
     };
