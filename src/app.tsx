@@ -106,13 +106,15 @@ export default function App() {
   }, [scrollToBottom]);
 
   const agent = useAgent({
-    agent: "chat",
+    agent: "personal-assistant",
+    name: "main-assistant",
   });
 
   const {
     messages: agentMessages,
     input: agentInput,
-    handleInputChange: handleAgentInputChange,
+    setInput: setAgentInput,
+    append,
     handleSubmit: handleAgentSubmit,
     addToolResult,
     clearHistory,
@@ -120,13 +122,38 @@ export default function App() {
     stop,
   } = useAgentChat({
     agent,
-    maxSteps: 5,
+    onError: (error: Error) => {
+      console.error("Agent chat error:", error);
+    },
   });
 
-  // Scroll to bottom when messages change
+  // Update messages when agent messages change
   useEffect(() => {
-    agentMessages.length > 0 && scrollToBottom();
-  }, [agentMessages, scrollToBottom]);
+    if (agentMessages.length > 0) {
+      setMessages(agentMessages);
+    }
+  }, [agentMessages, setMessages]);
+
+  const handleSendMessage = useCallback(async (message: string) => {
+    if (!message.trim()) return;
+    
+    setInput("");
+    await append({
+      role: "user",
+      content: message,
+    });
+  }, [append, setInput]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    handleSendMessage(input);
+  };
+
+  const clearAllMessages = () => {
+    clearHistory();
+    setMessages([]);
+    localStorage.removeItem("personal-assistant-messages");
+  };
 
   const pendingToolCallConfirmation = agentMessages.some((m: Message) =>
     m.parts?.some(
@@ -172,7 +199,7 @@ export default function App() {
               size="sm"
               shape="square"
               className="rounded-full h-9 w-9"
-              onClick={clearHistory}
+              onClick={clearAllMessages}
             >
               <Trash size={20} />
             </Button>
@@ -246,11 +273,7 @@ export default function App() {
               }`}
             >
               {message.role === "assistant" && (
-                <Avatar className="h-8 w-8 shrink-0">
-                  <AvatarFallback className="bg-primary text-primary-foreground">
-                    PA
-                  </AvatarFallback>
-                </Avatar>
+                <Avatar username="PA" className="h-8 w-8 shrink-0" />
               )}
               <div
                 className={`flex flex-col gap-1 ${
@@ -298,9 +321,7 @@ export default function App() {
                 )}
               </div>
               {message.role === "user" && (
-                <Avatar className="h-8 w-8 shrink-0">
-                  <AvatarFallback>You</AvatarFallback>
-                </Avatar>
+                <Avatar username="You" className="h-8 w-8 shrink-0" />
               )}
             </div>
           ))}

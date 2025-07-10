@@ -29,6 +29,13 @@ interface Note {
   createdAt?: string;
 }
 
+interface ScheduledTaskData {
+  taskId: string;
+  description: string;
+  priority: string;
+  recurring?: boolean;
+}
+
 export class PersonalAssistant extends Agent<Env> {
   async fetch(request: Request) {
     if (request.url.endsWith("/stream")) {
@@ -47,7 +54,43 @@ export class PersonalAssistant extends Agent<Env> {
       return this.handleNotes(request);
     }
     
+    if (path.endsWith("/scheduled")) {
+      return this.getScheduledTasks();
+    }
+    
     return new Response("Personal Assistant API", { status: 200 });
+  }
+
+  // Handle scheduled task execution
+  async executeScheduledTask(data: ScheduledTaskData) {
+    console.log(`Executing scheduled task: ${data.taskId} - ${data.description}`);
+    
+    // Create a regular task from the scheduled task
+    const task: Task = {
+      id: `task:${Date.now()}_${crypto.randomUUID()}`,
+      title: data.description,
+      description: `Scheduled task executed at ${new Date().toISOString()}`,
+      priority: data.priority,
+      status: "pending",
+      createdAt: new Date().toISOString()
+    };
+    
+    try {
+      // Save as a regular task
+      // @ts-ignore - env is available in the Agent runtime context
+      await this.env.TASKS_KV.put(task.id!, JSON.stringify(task));
+      
+      // If it's not recurring, remove the scheduled task
+      if (!data.recurring) {
+        // @ts-ignore - env is available in the Agent runtime context
+        await this.env.TASKS_KV.delete(`scheduled:${data.taskId}`);
+      }
+      
+      // You could also add a notification system here
+      console.log(`Task created from schedule: ${task.id}`);
+    } catch (error) {
+      console.error(`Failed to execute scheduled task: ${error}`);
+    }
   }
 
   private async streamResponse(request: Request) {
@@ -67,7 +110,7 @@ export class PersonalAssistant extends Agent<Env> {
 - Efficient in task management and scheduling
 
 Your capabilities include:
-1. Task Management - Creating, tracking, and organizing tasks
+1. Task Management - Creating, tracking, organizing, and updating tasks
 2. Scheduling - Setting reminders, appointments, and recurring events
 3. Note Taking - Capturing and organizing thoughts and information
 4. Information Retrieval - Searching the web for current information
@@ -76,12 +119,26 @@ Your capabilities include:
 7. Email Assistance - Helping draft professional emails
 8. Daily Planning - Organizing daily schedules and priorities
 
+Available tools you can use:
+- getCurrentTime: Get current date and time
+- calculate: Perform mathematical calculations
+- scheduleTask: Schedule one-time, delayed, or recurring tasks
+- createTask: Create a new task with details
+- takeNote: Create a note with optional tags
+- listTasks: List tasks with optional filters
+- updateTask: Update task status or details
+- searchNotes: Search through notes
+- getWeather: Get weather information (requires confirmation)
+- searchWeb: Search the internet (requires confirmation)
+- draftEmail: Generate email drafts (requires confirmation)
+
 Always aim to:
 - Anticipate user needs based on context
 - Provide clear, actionable responses
 - Offer to help with follow-up tasks
 - Remember context from the conversation
-- Be respectful of the user's time`,
+- Be respectful of the user's time
+- Use the appropriate tools to help the user`,
       maxSteps: 10,
       onStepFinish: (event: any) => {
         console.log(JSON.stringify(event, null, 2));
@@ -137,8 +194,8 @@ Always aim to:
     
     if (method === "DELETE") {
       // Delete a task
-      const { taskId } = await request.json();
-      await this.env.TASKS_KV.delete(taskId);
+      const body: { taskId: string } = await request.json();
+      await this.env.TASKS_KV.delete(body.taskId);
       return Response.json({ success: true });
     }
     
@@ -172,7 +229,26 @@ Always aim to:
       return Response.json({ success: true, noteId });
     }
     
+    if (method === "DELETE") {
+      // Delete a note
+      const body: { noteId: string } = await request.json();
+      await this.env.NOTES_KV.delete(body.noteId);
+      return Response.json({ success: true });
+    }
+    
     return Response.json({ error: "Method not allowed" }, { status: 405 });
+  }
+  
+  private async getScheduledTasks() {
+    // Get all scheduled tasks
+    const scheduled = await this.env.TASKS_KV.list({ prefix: "scheduled:" });
+    const scheduledList = await Promise.all(
+      scheduled.keys.map(async (key: any) => {
+        const task = await this.env.TASKS_KV.get(key.name, "json");
+        return task;
+      })
+    );
+    return Response.json({ scheduled: scheduledList.filter(Boolean) });
   }
 }
 
@@ -191,6 +267,11 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers });
+    }
+
+    // Check for OpenAI API key
+    if (!env.OPENAI_API_KEY) {
+      console.error("OPENAI_API_KEY is not set. Please set it in your .dev.vars file locally or as a secret in production.");
     }
 
     // Route to the personal assistant durable object
