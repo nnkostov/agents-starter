@@ -12,16 +12,16 @@ import { Toggle } from "@/components/toggle/Toggle";
 import { Textarea } from "@/components/textarea/Textarea";
 import { MemoizedMarkdown } from "@/components/memoized-markdown";
 import { ToolInvocationCard } from "@/components/tool-invocation-card/ToolInvocationCard";
+import useTheme from "./hooks/useTheme";
 
 // Icon imports
 import {
-  Bug,
   Moon,
-  Robot,
   Sun,
+  Bug,
   Trash,
-  PaperPlaneTilt,
-  Stop,
+  PaperPlaneLine,
+  Robot,
 } from "@phosphor-icons/react";
 
 // List of tools that require human confirmation
@@ -30,15 +30,57 @@ const toolsRequiringConfirmation: (keyof typeof tools)[] = [
   "getWeatherInformation",
 ];
 
-export default function Chat() {
+// State interface for chat messages
+interface ChatState {
+  messages: Message[];
+  loading: boolean;
+  openAIKeySet: boolean;
+}
+
+// Custom hook for persisting messages in session storage
+function usePersistedMessages(key: string) {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    // Check localStorage first, default to dark if not found
+    const savedMessages = localStorage.getItem(key);
+    return savedMessages ? JSON.parse(savedMessages) : [];
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(messages));
+  }, [messages, key]);
+
+  return messages;
+}
+
+// Main App component - Personal Assistant Interface
+export default function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     // Check localStorage first, default to dark if not found
     const savedTheme = localStorage.getItem("theme");
     return (savedTheme as "dark" | "light") || "dark";
   });
-  const [showDebug, setShowDebug] = useState(false);
-  const [textareaHeight, setTextareaHeight] = useState("auto");
+  
+  useTheme(theme);
+  
+  const toggleTheme = () => {
+    const newTheme = theme === "dark" ? "light" : "dark";
+    setTheme(newTheme);
+    localStorage.setItem("theme", newTheme);
+  };
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = usePersistedMessages("personal-assistant-messages");
+  const [showConfirmationModal, setShowConfirmationModal] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [currentConfirmation, setCurrentConfirmation] = useState<{
+    toolName: string;
+    toolCallId: string;
+    args: any;
+  } | null>(null);
+
+  const toolsRequiringConfirmation = ["getWeather", "searchWeb", "draftEmail"];
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -63,11 +105,6 @@ export default function Chat() {
     scrollToBottom();
   }, [scrollToBottom]);
 
-  const toggleTheme = () => {
-    const newTheme = theme === "dark" ? "light" : "dark";
-    setTheme(newTheme);
-  };
-
   const agent = useAgent({
     agent: "chat",
   });
@@ -79,7 +116,7 @@ export default function Chat() {
     handleSubmit: handleAgentSubmit,
     addToolResult,
     clearHistory,
-    isLoading,
+    isLoading: isLoadingAgent,
     stop,
   } = useAgentChat({
     agent,
@@ -107,195 +144,166 @@ export default function Chat() {
   };
 
   return (
-    <div className="h-[100vh] w-full p-4 flex justify-center items-center bg-fixed overflow-hidden">
-      <HasOpenAIKey />
-      <div className="h-[calc(100vh-2rem)] w-full mx-auto max-w-lg flex flex-col shadow-xl rounded-md overflow-hidden relative border border-neutral-300 dark:border-neutral-800">
-        <div className="px-4 py-3 border-b border-neutral-300 dark:border-neutral-800 flex items-center gap-3 sticky top-0 z-10">
-          <div className="flex items-center justify-center h-8 w-8">
-            <svg
-              width="28px"
-              height="28px"
-              className="text-[#F48120]"
-              data-icon="agents"
+    <div className="flex flex-col h-screen bg-background">
+      {/* Header */}
+      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="max-w-7xl mx-auto flex h-14 items-center justify-between px-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+              <span className="text-sm font-bold">PA</span>
+            </div>
+            <h1 className="text-xl font-semibold">Personal Assistant</h1>
+            <span className="px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-600 dark:bg-blue-400/10 dark:text-blue-400 rounded-md">
+              Beta
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              shape="square"
+              className="rounded-full h-9 w-9"
+              onClick={toggleTheme}
             >
-              <title>Cloudflare Agents</title>
-              {/** biome-ignore lint/nursery/useUniqueElementIds: it's fine */}
-              <symbol id="ai:local:agents" viewBox="0 0 80 79">
-                <path
-                  fill="currentColor"
-                  d="M69.3 39.7c-3.1 0-5.8 2.1-6.7 5H48.3V34h4.6l4.5-2.5c1.1.8 2.5 1.2 3.9 1.2 3.8 0 7-3.1 7-7s-3.1-7-7-7-7 3.1-7 7c0 .9.2 1.8.5 2.6L51.9 30h-3.5V18.8h-.1c-1.3-1-2.9-1.6-4.5-1.9h-.2c-1.9-.3-3.9-.1-5.8.6-.4.1-.8.3-1.2.5h-.1c-.1.1-.2.1-.3.2-1.7 1-3 2.4-4 4 0 .1-.1.2-.1.2l-.3.6c0 .1-.1.1-.1.2v.1h-.6c-2.9 0-5.7 1.2-7.7 3.2-2.1 2-3.2 4.8-3.2 7.7 0 .7.1 1.4.2 2.1-1.3.9-2.4 2.1-3.2 3.5s-1.2 2.9-1.4 4.5c-.1 1.6.1 3.2.7 4.7s1.5 2.9 2.6 4c-.8 1.8-1.2 3.7-1.1 5.6 0 1.9.5 3.8 1.4 5.6s2.1 3.2 3.6 4.4c1.3 1 2.7 1.7 4.3 2.2v-.1q2.25.75 4.8.6h.1c0 .1.1.1.1.1.9 1.7 2.3 3 4 4 .1.1.2.1.3.2h.1c.4.2.8.4 1.2.5 1.4.6 3 .8 4.5.7.4 0 .8-.1 1.3-.1h.1c1.6-.3 3.1-.9 4.5-1.9V62.9h3.5l3.1 1.7c-.3.8-.5 1.7-.5 2.6 0 3.8 3.1 7 7 7s7-3.1 7-7-3.1-7-7-7c-1.5 0-2.8.5-3.9 1.2l-4.6-2.5h-4.6V48.7h14.3c.9 2.9 3.5 5 6.7 5 3.8 0 7-3.1 7-7s-3.1-7-7-7m-7.9-16.9c1.6 0 3 1.3 3 3s-1.3 3-3 3-3-1.3-3-3 1.4-3 3-3m0 41.4c1.6 0 3 1.3 3 3s-1.3 3-3 3-3-1.3-3-3 1.4-3 3-3M44.3 72c-.4.2-.7.3-1.1.3-.2 0-.4.1-.5.1h-.2c-.9.1-1.7 0-2.6-.3-1-.3-1.9-.9-2.7-1.7-.7-.8-1.3-1.7-1.6-2.7l-.3-1.5v-.7q0-.75.3-1.5c.1-.2.1-.4.2-.7s.3-.6.5-.9c0-.1.1-.1.1-.2.1-.1.1-.2.2-.3s.1-.2.2-.3c0 0 0-.1.1-.1l.6-.6-2.7-3.5c-1.3 1.1-2.3 2.4-2.9 3.9-.2.4-.4.9-.5 1.3v.1c-.1.2-.1.4-.1.6-.3 1.1-.4 2.3-.3 3.4-.3 0-.7 0-1-.1-2.2-.4-4.2-1.5-5.5-3.2-1.4-1.7-2-3.9-1.8-6.1q.15-1.2.6-2.4l.3-.6c.1-.2.2-.4.3-.5 0 0 0-.1.1-.1.4-.7.9-1.3 1.5-1.9 1.6-1.5 3.8-2.3 6-2.3q1.05 0 2.1.3v-4.5c-.7-.1-1.4-.2-2.1-.2-1.8 0-3.5.4-5.2 1.1-.7.3-1.3.6-1.9 1s-1.1.8-1.7 1.3c-.3.2-.5.5-.8.8-.6-.8-1-1.6-1.3-2.6-.2-1-.2-2 0-2.9.2-1 .6-1.9 1.3-2.6.6-.8 1.4-1.4 2.3-1.8l1.8-.9-.7-1.9c-.4-1-.5-2.1-.4-3.1s.5-2.1 1.1-2.9q.9-1.35 2.4-2.1c.9-.5 2-.8 3-.7.5 0 1 .1 1.5.2 1 .2 1.8.7 2.6 1.3s1.4 1.4 1.8 2.3l4.1-1.5c-.9-2-2.3-3.7-4.2-4.9q-.6-.3-.9-.6c.4-.7 1-1.4 1.6-1.9.8-.7 1.8-1.1 2.9-1.3.9-.2 1.7-.1 2.6 0 .4.1.7.2 1.1.3V72zm25-22.3c-1.6 0-3-1.3-3-3 0-1.6 1.3-3 3-3s3 1.3 3 3c0 1.6-1.3 3-3 3"
-                />
-              </symbol>
-              <use href="#ai:local:agents" />
-            </svg>
+              {theme === "dark" ? <Sun size={20} /> : <Moon size={20} />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              shape="square"
+              className="rounded-full h-9 w-9"
+              onClick={clearHistory}
+            >
+              <Trash size={20} />
+            </Button>
           </div>
-
-          <div className="flex-1">
-            <h2 className="font-semibold text-base">AI Chat Agent</h2>
-          </div>
-
-          <div className="flex items-center gap-2 mr-2">
-            <Bug size={16} />
-            <Toggle
-              toggled={showDebug}
-              aria-label="Toggle debug mode"
-              onClick={() => setShowDebug((prev) => !prev)}
-            />
-          </div>
-
-          <Button
-            variant="ghost"
-            size="md"
-            shape="square"
-            className="rounded-full h-9 w-9"
-            onClick={toggleTheme}
-          >
-            {theme === "dark" ? <Sun size={20} /> : <Moon size={20} />}
-          </Button>
-
-          <Button
-            variant="ghost"
-            size="md"
-            shape="square"
-            className="rounded-full h-9 w-9"
-            onClick={clearHistory}
-          >
-            <Trash size={20} />
-          </Button>
         </div>
+      </header>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-24 max-h-[calc(100vh-10rem)]">
-          {agentMessages.length === 0 && (
-            <div className="h-full flex items-center justify-center">
-              <Card className="p-6 max-w-md mx-auto bg-neutral-100 dark:bg-neutral-900">
-                <div className="text-center space-y-4">
-                  <div className="bg-[#F48120]/10 text-[#F48120] rounded-full p-3 inline-flex">
-                    <Robot size={24} />
-                  </div>
-                  <h3 className="font-semibold text-lg">Welcome to AI Chat</h3>
-                  <p className="text-muted-foreground text-sm">
-                    Start a conversation with your AI assistant. Try asking
-                    about:
+      {/* Main content area */}
+      <main className="flex-1 overflow-y-auto">
+        <div className="max-w-4xl mx-auto p-4 space-y-6">
+          {/* Welcome message if no messages */}
+          {messages.length === 0 && (
+            <div className="text-center py-12 px-4">
+              <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 mb-4">
+                <span className="text-2xl">🤖</span>
+              </div>
+              <h2 className="text-2xl font-semibold mb-2">
+                Welcome to Your Personal Assistant
+              </h2>
+              <p className="text-muted-foreground max-w-md mx-auto mb-8">
+                I'm here to help you manage tasks, schedule reminders, take notes, and more. 
+                Just ask me anything!
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-2xl mx-auto">
+                <button
+                  onClick={() => handleSendMessage("What can you help me with?")}
+                  className="text-left p-4 rounded-lg border hover:bg-accent transition-colors"
+                >
+                  <h3 className="font-medium mb-1">💡 Capabilities</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Learn what I can do for you
                   </p>
-                  <ul className="text-sm text-left space-y-2">
-                    <li className="flex items-center gap-2">
-                      <span className="text-[#F48120]">•</span>
-                      <span>Weather information for any city</span>
-                    </li>
-                    <li className="flex items-center gap-2">
-                      <span className="text-[#F48120]">•</span>
-                      <span>Local time in different locations</span>
-                    </li>
-                  </ul>
-                </div>
-              </Card>
+                </button>
+                <button
+                  onClick={() => handleSendMessage("Create a task for tomorrow")}
+                  className="text-left p-4 rounded-lg border hover:bg-accent transition-colors"
+                >
+                  <h3 className="font-medium mb-1">✅ Create Task</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Start managing your to-dos
+                  </p>
+                </button>
+                <button
+                  onClick={() => handleSendMessage("Schedule a reminder in 30 minutes")}
+                  className="text-left p-4 rounded-lg border hover:bg-accent transition-colors"
+                >
+                  <h3 className="font-medium mb-1">⏰ Set Reminder</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Never forget important things
+                  </p>
+                </button>
+                <button
+                  onClick={() => handleSendMessage("Take a note about my meeting")}
+                  className="text-left p-4 rounded-lg border hover:bg-accent transition-colors"
+                >
+                  <h3 className="font-medium mb-1">📝 Take Note</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Capture your thoughts quickly
+                  </p>
+                </button>
+              </div>
             </div>
           )}
 
-          {agentMessages.map((m: Message, index) => {
-            const isUser = m.role === "user";
-            const showAvatar =
-              index === 0 || agentMessages[index - 1]?.role !== m.role;
-
-            return (
-              <div key={m.id}>
-                {showDebug && (
-                  <pre className="text-xs text-muted-foreground overflow-scroll">
-                    {JSON.stringify(m, null, 2)}
-                  </pre>
-                )}
-                <div
-                  className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+          {/* Messages */}
+          {messages.map((message, index) => (
+            <div
+              key={index}
+              className={`flex gap-3 ${
+                message.role === "user" ? "justify-end" : ""
+              }`}
+            >
+              {message.role === "assistant" && (
+                <Avatar className="h-8 w-8 shrink-0">
+                  <AvatarFallback className="bg-primary text-primary-foreground">
+                    PA
+                  </AvatarFallback>
+                </Avatar>
+              )}
+              <div
+                className={`flex flex-col gap-1 ${
+                  message.role === "user" ? "items-end" : "items-start flex-1"
+                }`}
+              >
+                <Card
+                  className={`px-4 py-3 max-w-[85%] ${
+                    message.role === "user"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-card"
+                  }`}
                 >
-                  <div
-                    className={`flex gap-2 max-w-[85%] ${
-                      isUser ? "flex-row-reverse" : "flex-row"
-                    }`}
-                  >
-                    {showAvatar && !isUser ? (
-                      <Avatar username={"AI"} />
-                    ) : (
-                      !isUser && <div className="w-8" />
-                    )}
-
-                    <div>
-                      <div>
-                        {m.parts?.map((part, i) => {
-                          if (part.type === "text") {
-                            return (
-                              // biome-ignore lint/suspicious/noArrayIndexKey: immutable index
-                              <div key={i}>
-                                <Card
-                                  className={`p-3 rounded-md bg-neutral-100 dark:bg-neutral-900 ${
-                                    isUser
-                                      ? "rounded-br-none"
-                                      : "rounded-bl-none border-assistant-border"
-                                  } ${
-                                    part.text.startsWith("scheduled message")
-                                      ? "border-accent/50"
-                                      : ""
-                                  } relative`}
-                                >
-                                  {part.text.startsWith(
-                                    "scheduled message"
-                                  ) && (
-                                    <span className="absolute -top-3 -left-2 text-base">
-                                      🕒
-                                    </span>
-                                  )}
-                                  <MemoizedMarkdown
-                                    id={`${m.id}-${i}`}
-                                    content={part.text.replace(
-                                      /^scheduled message: /,
-                                      ""
-                                    )}
-                                  />
-                                </Card>
-                                <p
-                                  className={`text-xs text-muted-foreground mt-1 ${
-                                    isUser ? "text-right" : "text-left"
-                                  }`}
-                                >
-                                  {formatTime(
-                                    new Date(m.createdAt as unknown as string)
-                                  )}
-                                </p>
-                              </div>
-                            );
-                          }
-
-                          if (part.type === "tool-invocation") {
-                            const toolInvocation = part.toolInvocation;
-                            const toolCallId = toolInvocation.toolCallId;
-                            const needsConfirmation =
-                              toolsRequiringConfirmation.includes(
-                                toolInvocation.toolName as keyof typeof tools
-                              );
-
-                            // Skip rendering the card in debug mode
-                            if (showDebug) return null;
-
-                            return (
-                              <ToolInvocationCard
-                                // biome-ignore lint/suspicious/noArrayIndexKey: using index is safe here as the array is static
-                                key={`${toolCallId}-${i}`}
-                                toolInvocation={toolInvocation}
-                                toolCallId={toolCallId}
-                                needsConfirmation={needsConfirmation}
-                                addToolResult={addToolResult}
-                              />
-                            );
-                          }
-                          return null;
-                        })}
-                      </div>
+                  {message.content && (
+                    <MemoizedMarkdown
+                      content={message.content}
+                      className={
+                        message.role === "user" ? "prose-invert" : ""
+                      }
+                    />
+                  )}
+                  {message.toolInvocations && (
+                    <div className="mt-3 space-y-2">
+                      {message.toolInvocations.map((tool) => (
+                        <ToolInvocationCard
+                          key={tool.toolCallId}
+                          tool={tool}
+                          result={tool.result}
+                          isLoading={isLoading && !tool.result}
+                        />
+                      ))}
                     </div>
-                  </div>
-                </div>
+                  )}
+                </Card>
+                {message.role === "assistant" && (
+                  <span className="text-xs text-muted-foreground px-1">
+                    {new Date(message.createdAt || Date.now()).toLocaleTimeString(
+                      [],
+                      {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      }
+                    )}
+                  </span>
+                )}
               </div>
-            );
-          })}
+              {message.role === "user" && (
+                <Avatar className="h-8 w-8 shrink-0">
+                  <AvatarFallback>You</AvatarFallback>
+                </Avatar>
+              )}
+            </div>
+          ))}
           <div ref={messagesEndRef} />
         </div>
 
@@ -370,7 +378,7 @@ export default function Chat() {
             </div>
           </div>
         </form>
-      </div>
+      </main>
     </div>
   );
 }

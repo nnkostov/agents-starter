@@ -1,129 +1,192 @@
 // via https://github.com/vercel/ai/blob/main/examples/next-openai/app/api/use-chat-human-in-the-loop/utils.ts
 
-import { formatDataStreamPart, type Message } from "@ai-sdk/ui-utils";
-import {
-  convertToCoreMessages,
-  type DataStreamWriter,
-  type ToolExecutionOptions,
-  type ToolSet,
-} from "ai";
-import type { z } from "zod";
-import { APPROVAL } from "./shared";
+import type { ClientMessage, Message } from "ai";
+import { parseStreamPart } from "ai";
+import { createParser } from "eventsource-parser";
 
-function isValidToolName<K extends PropertyKey, T extends object>(
-  key: K,
-  obj: T
-): key is K & keyof T {
-  return key in obj;
+/**
+ * Creates an agent client that connects to the Personal Assistant
+ * Supports both WebSocket and HTTP connections
+ * @param id - Optional ID for the agent instance
+ * @returns Agent client with send and connect methods
+ */
+export function createAgentClient(id = "main-assistant") {
+  const baseUrl = window.location.origin;
+  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+
+  return {
+    // Send messages via HTTP POST
+    async send(messages: ClientMessage[]) {
+      const response = await fetch(`${baseUrl}/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(messages),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      return response;
+    },
+
+    // Connect via WebSocket for real-time communication
+    connect() {
+      const ws = new WebSocket(
+        `${wsProtocol}//${window.location.host}/agents/personal-assistant/${id}`
+      );
+
+      return {
+        send: (data: string) => ws.send(data),
+        onMessage: (handler: (event: MessageEvent) => void) => {
+          ws.onmessage = handler;
+        },
+        onError: (handler: (event: Event) => void) => {
+          ws.onerror = handler;
+        },
+        onClose: (handler: (event: CloseEvent) => void) => {
+          ws.onclose = handler;
+        },
+        close: () => ws.close(),
+      };
+    },
+  };
 }
 
 /**
- * Processes tool invocations where human input is required, executing tools when authorized.
- *
- * @param options - The function options
- * @param options.tools - Map of tool names to Tool instances that may expose execute functions
- * @param options.dataStream - Data stream for sending results back to the client
- * @param options.messages - Array of messages to process
- * @param executionFunctions - Map of tool names to execute functions
- * @returns Promise resolving to the processed messages
+ * Parses streaming data responses from the AI
+ * Handles both text content and structured data
+ * @param data - Raw streaming data
+ * @returns Parsed content as Message array or null
  */
-export async function processToolCalls<
-  Tools extends ToolSet,
-  ExecutableTools extends {
-    // biome-ignore lint/complexity/noBannedTypes: it's fine
-    [Tool in keyof Tools as Tools[Tool] extends { execute: Function }
-      ? never
-      : Tool]: Tools[Tool];
-  },
->({
-  dataStream,
-  messages,
-  executions,
-}: {
-  tools: Tools; // used for type inference
-  dataStream: DataStreamWriter;
-  messages: Message[];
-  executions: {
-    [K in keyof Tools & keyof ExecutableTools]?: (
-      args: z.infer<ExecutableTools[K]["parameters"]>,
-      context: ToolExecutionOptions
-    ) => Promise<unknown>;
-  };
-}): Promise<Message[]> {
-  const lastMessage = messages[messages.length - 1];
-  const parts = lastMessage.parts;
-  if (!parts) return messages;
+export function parseStreamingDataResponse(data: string): Message[] | null {
+  const trimmedData = data.trim();
+  if (!trimmedData || trimmedData === "{}") return null;
 
-  const processedParts = await Promise.all(
-    parts.map(async (part) => {
-      // Only process tool invocations parts
-      if (part.type !== "tool-invocation") return part;
+  if (trimmedData.startsWith("0:")) {
+    try {
+      return JSON.parse(trimmedData.slice(2)) as Message[];
+    } catch (e) {
+      console.error("Failed to parse messages:", e);
+      return null;
+    }
+  }
 
-      const { toolInvocation } = part;
-      const toolName = toolInvocation.toolName;
+  if (trimmedData.startsWith("8:") || trimmedData.startsWith("e:")) {
+    const content = trimmedData.slice(2);
+    try {
+      const json = JSON.parse(content);
+      return [json];
+    } catch (e) {
+      console.error("Failed to parse JSON content:", e);
+      return null;
+    }
+  }
 
-      // Only continue if we have an execute function for the tool (meaning it requires confirmation) and it's in a 'result' state
-      if (!(toolName in executions) || toolInvocation.state !== "result")
-        return part;
-
-      let result: unknown;
-
-      if (toolInvocation.result === APPROVAL.YES) {
-        // Get the tool and check if the tool has an execute function.
-        if (
-          !isValidToolName(toolName, executions) ||
-          toolInvocation.state !== "result"
-        ) {
-          return part;
+  try {
+    const parser = createParser((event) => {
+      if (event.type === "data" && event.data) {
+        const parsed = parseStreamPart(event.data);
+        if (parsed.type === "text") {
+          return [
+            {
+              role: "assistant",
+              content: parsed.value,
+            },
+          ];
         }
-
-        const toolInstance = executions[toolName];
-        if (toolInstance) {
-          result = await toolInstance(toolInvocation.args, {
-            messages: convertToCoreMessages(messages),
-            toolCallId: toolInvocation.toolCallId,
-          });
-        } else {
-          result = "Error: No execute function found on tool";
-        }
-      } else if (toolInvocation.result === APPROVAL.NO) {
-        result = "Error: User denied access to tool execution";
-      } else {
-        // For any unhandled responses, return the original part.
-        return part;
       }
+    });
 
-      // Forward updated tool result to the client.
-      dataStream.write(
-        formatDataStreamPart("tool_result", {
-          toolCallId: toolInvocation.toolCallId,
-          result,
-        })
-      );
+    parser.feed(trimmedData);
+  } catch (e) {
+    console.error("Failed to parse streaming data:", e);
+  }
 
-      // Return updated toolInvocation with the actual result.
-      return {
-        ...part,
-        toolInvocation: {
-          ...toolInvocation,
-          result,
-        },
-      };
-    })
-  );
-
-  // Finally return the processed messages
-  return [...messages.slice(0, -1), { ...lastMessage, parts: processedParts }];
+  return null;
 }
 
-// export function getToolsRequiringConfirmation<
-//   T extends ToolSet
-//   // E extends {
-//   //   [K in keyof T as T[K] extends { execute: Function } ? never : K]: T[K];
-//   // },
-// >(tools: T): string[] {
-//   return (Object.keys(tools) as (keyof T)[]).filter((key) => {
-//     const maybeTool = tools[key];
-//     return typeof maybeTool.execute !== "function";
-//   }) as string[];
-// }
+/**
+ * Formats a message timestamp for display
+ * @param date - Date to format
+ * @returns Formatted time string
+ */
+export function formatTime(date: Date): string {
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * Debounces a function call
+ * @param func - Function to debounce
+ * @param wait - Wait time in milliseconds
+ * @returns Debounced function
+ */
+export function debounce<T extends (...args: any[]) => void>(
+  func: T,
+  wait: number
+): (...args: Parameters<T>) => void {
+  let timeout: ReturnType<typeof setTimeout>;
+  return (...args: Parameters<T>) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), wait);
+  };
+}
+
+/**
+ * Process tool calls and handle confirmations
+ * @param messages - Array of messages
+ * @param dataStream - Data stream for responses
+ * @param tools - Available tools
+ * @param executions - Tool execution functions
+ * @returns Processed messages
+ */
+export async function processToolCalls({
+  messages,
+  dataStream,
+  tools,
+  executions,
+}: {
+  messages: Message[];
+  dataStream: any;
+  tools: Record<string, any>;
+  executions: Record<string, any>;
+}): Promise<Message[]> {
+  const lastMessage = messages[messages.length - 1];
+  
+  if (
+    lastMessage.role === "assistant" &&
+    lastMessage.toolInvocations &&
+    lastMessage.toolInvocations.length > 0
+  ) {
+    for (const toolInvocation of lastMessage.toolInvocations) {
+      if ("result" in toolInvocation) continue;
+
+      const { toolCallId, toolName, args } = toolInvocation;
+
+      if (tools[toolName]?.execute) {
+        // Auto-execute tools that have an execute function
+        const result = await tools[toolName].execute(args);
+        dataStream.writeData({
+          type: "tool-result",
+          toolCallId,
+          result,
+        });
+      } else if (executions[toolName]) {
+        // Execute confirmed tools
+        const result = await executions[toolName](args);
+        dataStream.writeData({
+          type: "tool-result", 
+          toolCallId,
+          result,
+        });
+      }
+    }
+  }
+
+  return messages;
+}

@@ -1,26 +1,39 @@
 {
-  "name": "my-chat-agent",
+  "name": "personal-assistant",
   "main": "src/server.ts",
-  "compatibility_date": "2025-05-07",
-  "compatibility_flags": [
-    "nodejs_compat",
-    "nodejs_compat_populate_process_env",
-  ],
-  "assets": {
-    "directory": "public",
+  "compatibility_date": "2025-02-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
   },
+  "kv_namespaces": [
+    {
+      "binding": "TASKS_KV",
+      "id": "tasks_kv_namespace",
+      "preview_id": "tasks_kv_namespace_preview"
+    },
+    {
+      "binding": "NOTES_KV", 
+      "id": "notes_kv_namespace",
+      "preview_id": "notes_kv_namespace_preview"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
-        "name": "Chat",
-        "class_name": "Chat",
-      },
-    ],
+        "name": "PersonalAssistant",
+        "class_name": "PersonalAssistant"
+      }
+    ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Chat"],
-    },
+      "new_sqlite_classes": ["PersonalAssistant"]
+    }
   ],
+  "dev": {
+    "port": 8787,
+    "inspector_port": 9229
+  }
 }
